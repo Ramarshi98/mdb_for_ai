@@ -1,0 +1,92 @@
+{
+  "name": "venues_autocomplete",
+  "type": "search",
+  "collectionName": "venues",
+  "database": "atlastrips",
+  "definition": {
+    "analyzer": "lucene.standard",
+    "searchAnalyzer": "lucene.standard",
+    "mappings": {
+      "dynamic": false,
+      "fields": {
+        "name": [
+          {
+            "type": "autocomplete",
+            "analyzer": "lucene.standard",
+            "tokenization": "edgeGram",
+            "minGrams": 2,
+            "maxGrams": 15,
+            "foldDiacritics": true
+          },
+          {
+            "type": "string",
+            "analyzer": "lucene.standard"
+          }
+        ],
+        "category": [
+          {
+            "type": "autocomplete",
+            "analyzer": "lucene.standard",
+            "tokenization": "edgeGram",
+            "minGrams": 2,
+            "maxGrams": 15,
+            "foldDiacritics": true
+          },
+          {
+            "type": "string",
+            "analyzer": "lucene.standard"
+          }
+        ],
+        "brand": [
+          {
+            "type": "string",
+            "analyzer": "lucene.standard"
+          }
+        ],
+        "search_keywords": [
+          {
+            "type": "string",
+            "analyzer": "lucene.standard"
+          }
+        ],
+        "region": {
+          "type": "document",
+          "fields": {
+            "city": [
+              {
+                "type": "autocomplete",
+                "analyzer": "lucene.standard",
+                "tokenization": "edgeGram",
+                "minGrams": 2,
+                "maxGrams": 15,
+                "foldDiacritics": true
+              },
+              {
+                "type": "string",
+                "analyzer": "lucene.standard"
+              }
+            ],
+            "country": [
+              {
+                "type": "string",
+                "analyzer": "lucene.standard"
+              }
+            ],
+            "continent": [
+              {
+                "type": "string",
+                "analyzer": "lucene.standard"
+              }
+            ],
+            "airport_code": [
+              {
+                "type": "string",
+                "analyzer": "lucene.standard"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

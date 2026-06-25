@@ -1,0 +1,16 @@
+# --- AtlasTrips: dependency manifest ---
+# Application
+streamlit==1.38.0
+pymongo[srv]==4.8.0
+motor==3.5.1
+python-dotenv==1.0.1
+pandas==2.2.2
+
+# Seeding / fake data generation
+faker==26.0.0
+
+# Load testing
+locust==2.31.1
+
+# Misc
+pydantic==2.8.2
