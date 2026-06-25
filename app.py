@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+from st_keyup import st_keyup
 
 from db.connection import (
     COLLECTION_NAME,
@@ -90,12 +90,18 @@ if not MONGODB_ATLAS_URI:
 defaults = {
     "selected_venue_id": None,
     "my_bookings": [],
+    "query_input": "",
     "last_pipeline": None,
     "last_action_label": "No action yet -- run a search or open a venue to see its live MQL here.",
     "search_error": None,
 }
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
+
+
+def select_suggestion(venue_id: str, venue_name: str) -> None:
+    st.session_state.selected_venue_id = venue_id
+    st.session_state.query_input = venue_name
 
 # ---------------------------------------------------------------------------
 # Metrics: every operation below is timed and written to METRICS_COLLECTION
@@ -315,15 +321,18 @@ tab_ui, tab_internals = st.tabs(["\U0001F9ED Travel Search", "\U0001F6E0️ Behi
 with tab_ui:
     filter_col, _ = st.columns([2, 3])
     with filter_col:
-        category_label = st.segmented_control("Category", options=["All", "Hotels", "Lounges", "Events"], default="All")
+        category_label = st.radio("Category", options=["All", "Hotels", "Lounges", "Events"], horizontal=True)
     category_label = category_label or "All"
 
-    query = st.text_input(
+    query = st_keyup(
         "Search",
+        value=st.session_state.query_input,
         placeholder="Try ‘Marriott’, ‘Singapore’, ‘lounge’, ‘LHR’...",
         label_visibility="collapsed",
         key="query_input",
+        debounce=150,
     )
+    query = query or ""
 
     results, suggestions_latency_ms = ([], None)
     if query and len(query.strip()) >= 1:
@@ -339,9 +348,13 @@ with tab_ui:
                 for r in results:
                     icon = CATEGORY_ICON.get(r.get("category"), "\U0001F4CD")
                     label = f"{icon} {r['name']} — {r['region']['city']}, {r['region']['country']}"
-                    if st.button(label, key=f"sugg_{r['venue_id']}", use_container_width=True):
-                        st.session_state.selected_venue_id = r["venue_id"]
-                        st.rerun()
+                    st.button(
+                        label,
+                        key=f"sugg_{r['venue_id']}",
+                        use_container_width=True,
+                        on_click=select_suggestion,
+                        args=(r["venue_id"], r["name"]),
+                    )
         else:
             st.info("No matches yet -- keep typing, or try a city/airport code like ‘DXB’.")
 
@@ -436,38 +449,92 @@ with tab_internals:
             "(JOINed on every read) and a separately-synced OpenSearch cluster for "
             "search -- two systems to keep consistent, scale, and pay for."
         )
-        mermaid_code = """
-flowchart LR
-    classDef mongo fill:#e7f7ee,stroke:#13aa52,stroke-width:2px,color:#0a3d22;
-    classDef legacy fill:#fdeceb,stroke:#c0392b,stroke-width:2px,color:#5a1f18;
-    classDef neutral fill:#eef1f5,stroke:#8a93a3,stroke-width:1px,color:#2b3340;
-
-    U[User request] --> M1
-    U --> L1
-
-    subgraph MDB["MongoDB Atlas path"]
-        M1[Streamlit App]:::neutral --> M2["MongoDB Atlas\\noperational data + $search\\n(single unified engine)"]:::mongo
-        M2 --> M3["One document back:\\nregion + pricing + availability\\n+ facilities embedded"]:::mongo
-    end
-
-    subgraph LEGACY["Aurora + ORM + OpenSearch path"]
-        L1[Web / App Server]:::neutral --> L2["ORM layer\\n(e.g. SQLAlchemy)"]:::legacy
-        L2 --> L3["Aurora / Postgres\\nvenues, regions, pricing,\\navailability, facilities tables"]:::legacy
-        L3 -->|"JOIN x4"| L4["Assembled row set"]:::legacy
-        L1 --> L5["CDC / Debezium sync"]:::legacy
-        L5 --> L6[("OpenSearch cluster")]:::legacy
-        L6 --> L7["Search hits\\n(possible index lag)"]:::legacy
-        L4 --> L8["App-side merge"]:::legacy
-        L7 --> L8
-        L8 --> L9["Response\\nmore hops, more failure modes"]:::legacy
-    end
-"""
-        html_code = (
-            "<div class=\"mermaid\">" + mermaid_code + "</div>"
-            "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js\"></script>"
-            "<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });</script>"
+        st.markdown(
+            """
+            <style>
+            .arch-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 18px;
+                margin-top: 18px;
+            }
+            .arch-lane {
+                border: 1px solid rgba(120,120,120,0.25);
+                border-radius: 16px;
+                padding: 18px;
+                background: rgba(120,120,120,0.04);
+            }
+            .arch-lane h4 { margin: 0 0 14px 0; }
+            .arch-node {
+                border-radius: 12px;
+                padding: 12px 14px;
+                margin: 10px 0;
+                font-weight: 650;
+                line-height: 1.25;
+                box-shadow: 0 1px 8px rgba(0,0,0,0.06);
+            }
+            .arch-node span { display: block; font-weight: 400; font-size: 0.88rem; margin-top: 4px; }
+            .arch-neutral { background: #eef1f5; border: 1px solid #8a93a3; color: #2b3340; }
+            .arch-mongo { background: #e7f7ee; border: 2px solid #13aa52; color: #0a3d22; }
+            .arch-legacy { background: #fdeceb; border: 2px solid #c0392b; color: #5a1f18; }
+            .arch-arrow { text-align: center; color: rgba(120,120,120,0.9); font-weight: 800; }
+            .arch-split {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+            }
+            @media (max-width: 900px) {
+                .arch-grid, .arch-split { grid-template-columns: 1fr; }
+            }
+            </style>
+            <div class="arch-grid">
+                <div class="arch-lane">
+                    <h4>MongoDB Atlas path</h4>
+                    <div class="arch-node arch-neutral">User request</div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-neutral">Streamlit App</div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-mongo">
+                        MongoDB Atlas
+                        <span>Operational data + Atlas Search in one unified engine</span>
+                    </div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-mongo">
+                        One document back
+                        <span>Region + pricing + availability + facilities embedded</span>
+                    </div>
+                </div>
+                <div class="arch-lane">
+                    <h4>Aurora + ORM + OpenSearch path</h4>
+                    <div class="arch-node arch-neutral">User request</div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-neutral">Web / App Server</div>
+                    <div class="arch-arrow">splits into two systems</div>
+                    <div class="arch-split">
+                        <div>
+                            <div class="arch-node arch-legacy">ORM layer<span>e.g. SQLAlchemy</span></div>
+                            <div class="arch-arrow">v</div>
+                            <div class="arch-node arch-legacy">Aurora / Postgres<span>Venues, regions, pricing, availability, facilities tables</span></div>
+                            <div class="arch-arrow">JOIN x4</div>
+                            <div class="arch-node arch-legacy">Assembled row set</div>
+                        </div>
+                        <div>
+                            <div class="arch-node arch-legacy">CDC / Debezium sync</div>
+                            <div class="arch-arrow">v</div>
+                            <div class="arch-node arch-legacy">OpenSearch cluster</div>
+                            <div class="arch-arrow">v</div>
+                            <div class="arch-node arch-legacy">Search hits<span>Possible index lag</span></div>
+                        </div>
+                    </div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-legacy">App-side merge</div>
+                    <div class="arch-arrow">v</div>
+                    <div class="arch-node arch-legacy">Response<span>More hops, more failure modes</span></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        components.html(html_code, height=560, scrolling=True)
 
     # ---- MQL inspector ----
     with sub_query:
