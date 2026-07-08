@@ -79,7 +79,8 @@ st.markdown(
 CATEGORY_ICON = {"hotel": "\U0001F3E8", "airport_lounge": "\U0001F6CB️", "event": "\U0001F3A4"}
 CATEGORY_FILTER_MAP = {"Hotels": "hotel", "Lounges": "airport_lounge", "Events": "event"}
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "")
-VOYAGE_EMBED_MODEL = os.getenv("VOYAGE_EMBED_MODEL", "voyage-4-lite")
+VOYAGE_BASE_URL = os.getenv("VOYAGE_BASE_URL", "https://ai.mongodb.com/v1")
+VOYAGE_EMBED_MODEL = os.getenv("VOYAGE_EMBED_MODEL", "voyage-4-large")
 BOOKING_VECTOR_INDEX_NAME = os.getenv("BOOKING_VECTOR_INDEX_NAME", "bookings_voyage_vector")
 VENUE_VECTOR_INDEX_NAME = os.getenv("VENUE_VECTOR_INDEX_NAME", "venues_voyage_vector")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -110,6 +111,8 @@ defaults = {
     "chat_history": [],
     "pending_cancel_booking_id": None,
     "last_booking_context": [],
+    "current_ai_trace": None,
+    "last_ai_trace": None,
     "last_pipeline": None,
     "last_action_label": "No action yet -- run a search or open a venue to see its live MQL here.",
     "search_error": None,
@@ -121,6 +124,37 @@ for k, v in defaults.items():
 def select_suggestion(venue_id: str, venue_name: str) -> None:
     st.session_state.selected_venue_id = venue_id
     st.session_state.query_input = venue_name
+
+
+def start_ai_trace(prompt: str) -> None:
+    st.session_state.current_ai_trace = {
+        "prompt": prompt,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "steps": [],
+    }
+
+
+def add_ai_trace_step(name: str, engine: str, detail: str, latency_ms: float) -> None:
+    trace = st.session_state.get("current_ai_trace")
+    if not trace:
+        return
+    trace["steps"].append({
+        "step": len(trace["steps"]) + 1,
+        "name": name,
+        "engine": engine,
+        "detail": detail,
+        "latency_ms": round(latency_ms, 2),
+    })
+
+
+def finish_ai_trace(answer: str) -> None:
+    trace = st.session_state.get("current_ai_trace")
+    if not trace:
+        return
+    trace["answer_preview"] = answer[:500]
+    trace["total_latency_ms"] = round(sum(step["latency_ms"] for step in trace["steps"]), 2)
+    st.session_state.last_ai_trace = trace
+    st.session_state.current_ai_trace = None
 
 
 def _strip_mongo_id(doc: dict) -> dict:
@@ -164,26 +198,74 @@ def search_terms(text: str) -> list[str]:
 
 
 def embed_text(text: str, input_type: str = "document"):
-    if not VOYAGE_API_KEY or not text.strip():
-        return None
-    try:
-        import voyageai
+    embeddings = embed_texts([text], input_type=input_type)
+    return embeddings[0] if embeddings else None
 
-        client = voyageai.Client(api_key=VOYAGE_API_KEY)
-        result = client.embed([text], model=VOYAGE_EMBED_MODEL, input_type=input_type)
-        return result.embeddings[0]
-    except Exception:
-        return None
+
+def embed_texts(texts: list[str], input_type: str = "document") -> list[list[float]]:
+    texts = [text for text in texts if text.strip()]
+    if not VOYAGE_API_KEY or not texts:
+        add_ai_trace_step("Embedding skipped", "Voyage AI", "VOYAGE_API_KEY is not configured.", 0.0)
+        return []
+    start = time.perf_counter()
+    try:
+        response = requests.post(
+            f"{VOYAGE_BASE_URL.rstrip('/')}/embeddings",
+            headers={
+                "Authorization": f"Bearer {VOYAGE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "input": texts,
+                "model": VOYAGE_EMBED_MODEL,
+                "input_type": input_type,
+                "truncation": True,
+                "output_dtype": "float",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        embeddings = [item["embedding"] for item in sorted(payload.get("data", []), key=lambda item: item["index"])]
+        add_ai_trace_step(
+            "Create query embedding",
+            "Voyage AI",
+            f"POST `{VOYAGE_BASE_URL.rstrip('/')}/embeddings`, model `{VOYAGE_EMBED_MODEL}`, input_type `{input_type}`, {len(texts)} input(s).",
+            (time.perf_counter() - start) * 1000,
+        )
+        return embeddings
+    except Exception as exc:
+        add_ai_trace_step(
+            "Create query embedding",
+            "Voyage AI",
+            f"Embedding failed: {exc}",
+            (time.perf_counter() - start) * 1000,
+        )
+        return []
 
 
 def fetch_user_bookings(include_cancelled: bool = True) -> list[dict]:
     query = {"session_user_id": st.session_state.session_user_id}
     if not include_cancelled:
         query["status"] = "confirmed"
+    start = time.perf_counter()
     try:
         docs = get_bookings_collection().find(query).sort("booked_at", -1).limit(50)
-        return [_strip_mongo_id(doc) for doc in docs]
-    except Exception:
+        results = [_strip_mongo_id(doc) for doc in docs]
+        add_ai_trace_step(
+            "Fetch user bookings",
+            "MongoDB Atlas",
+            f"find on `{BOOKINGS_COLLECTION_NAME}` returned {len(results)} booking(s).",
+            (time.perf_counter() - start) * 1000,
+        )
+        return results
+    except Exception as exc:
+        add_ai_trace_step(
+            "Fetch user bookings",
+            "MongoDB Atlas",
+            f"find failed, using session-state fallback: {exc}",
+            (time.perf_counter() - start) * 1000,
+        )
         return list(st.session_state.my_bookings)
 
 
@@ -204,19 +286,23 @@ def persist_booking(booking: dict) -> None:
 
 
 def cancel_booking(booking_id: str) -> tuple[bool, str]:
+    start = time.perf_counter()
     try:
         booking = get_bookings_collection().find_one({
             "booking_id": booking_id,
             "session_user_id": st.session_state.session_user_id,
         })
     except Exception as exc:
+        add_ai_trace_step("Lookup booking to cancel", "MongoDB Atlas", f"find_one failed: {exc}", (time.perf_counter() - start) * 1000)
         return False, f"I could not look up booking `{booking_id}`: {exc}"
+    add_ai_trace_step("Lookup booking to cancel", "MongoDB Atlas", f"find_one for `{booking_id}`.", (time.perf_counter() - start) * 1000)
     if not booking:
         return False, f"I could not find booking `{booking_id}` for this session."
     if booking.get("status") == "cancelled":
         return False, f"Booking `{booking_id}` is already cancelled."
 
     now = datetime.now(timezone.utc).isoformat()
+    start = time.perf_counter()
     try:
         get_bookings_collection().update_one(
             {"booking_id": booking_id, "session_user_id": st.session_state.session_user_id},
@@ -227,13 +313,31 @@ def cancel_booking(booking_id: str) -> tuple[bool, str]:
             {"$inc": {"availability_calendar.$.available_units": 1}},
         )
     except Exception as exc:
+        add_ai_trace_step("Cancel booking", "MongoDB Atlas", f"Booking/availability update failed: {exc}", (time.perf_counter() - start) * 1000)
         return False, f"I could not cancel booking `{booking_id}`: {exc}"
+    add_ai_trace_step("Cancel booking", "MongoDB Atlas", "Updated booking status and restored one available unit.", (time.perf_counter() - start) * 1000)
     st.session_state.my_bookings = fetch_user_bookings()
     record_metric("booking_cancel", 0.0, True)
     return True, f"Cancelled booking `{booking_id}` for {booking.get('venue_name')}."
 
 
 def search_booking_context(question: str, limit: int = 5) -> list[dict]:
+    def fallback_booking_context(reason: str) -> list[dict]:
+        terms = search_terms(question)
+        bookings = fetch_user_bookings(include_cancelled=True)
+        if not terms:
+            results = bookings[:limit]
+        else:
+            filtered = [booking for booking in bookings if any(term.lower() in booking_to_text(booking).lower() for term in terms)]
+            results = (filtered or bookings)[:limit]
+        add_ai_trace_step(
+            "Retrieve booking context",
+            "MongoDB Atlas",
+            f"{reason}; fallback booking lookup returned {len(results)} booking(s).",
+            0.0,
+        )
+        return results
+
     embedding = embed_text(question, input_type="query")
     if embedding:
         pipeline = [
@@ -250,16 +354,22 @@ def search_booking_context(question: str, limit: int = 5) -> list[dict]:
         try:
             st.session_state.last_pipeline = {"collection": BOOKINGS_COLLECTION_NAME, "operation": "aggregate", "pipeline": pipeline}
             st.session_state.last_action_label = f"Voyage embedding + Atlas Vector Search over bookings using `{VOYAGE_EMBED_MODEL}`."
-            return [_strip_mongo_id(doc) for doc in get_bookings_collection().aggregate(pipeline)]
-        except Exception:
-            pass
+            start = time.perf_counter()
+            results = [_strip_mongo_id(doc) for doc in get_bookings_collection().aggregate(pipeline)]
+            add_ai_trace_step(
+                "Retrieve booking context",
+                "MongoDB Atlas Vector Search",
+                f"$vectorSearch on `{BOOKINGS_COLLECTION_NAME}` returned {len(results)} booking(s).",
+                (time.perf_counter() - start) * 1000,
+            )
+            if results:
+                return results
+            return fallback_booking_context("Vector search returned no booking matches")
+        except Exception as exc:
+            add_ai_trace_step("Retrieve booking context", "MongoDB Atlas Vector Search", f"Vector search failed; falling back to find: {exc}", 0.0)
+            return fallback_booking_context("Vector search failed")
 
-    terms = search_terms(question)
-    bookings = fetch_user_bookings(include_cancelled=True)
-    if not terms:
-        return bookings[:limit]
-    filtered = [booking for booking in bookings if any(term.lower() in booking_to_text(booking).lower() for term in terms)]
-    return (filtered or bookings)[:limit]
+    return fallback_booking_context("Embeddings unavailable")
 
 
 def search_venue_context(question: str, limit: int = 5) -> list[dict]:
@@ -278,8 +388,17 @@ def search_venue_context(question: str, limit: int = 5) -> list[dict]:
         try:
             st.session_state.last_pipeline = {"collection": COLLECTION_NAME, "operation": "aggregate", "pipeline": pipeline}
             st.session_state.last_action_label = f"Voyage embedding + Atlas Vector Search over venues using `{VOYAGE_EMBED_MODEL}`."
-            return [_strip_mongo_id(doc) for doc in get_venues_collection().aggregate(pipeline)]
-        except Exception:
+            start = time.perf_counter()
+            results = [_strip_mongo_id(doc) for doc in get_venues_collection().aggregate(pipeline)]
+            add_ai_trace_step(
+                "Retrieve venue context",
+                "MongoDB Atlas Vector Search",
+                f"$vectorSearch on `{COLLECTION_NAME}` returned {len(results)} venue(s).",
+                (time.perf_counter() - start) * 1000,
+            )
+            return results
+        except Exception as exc:
+            add_ai_trace_step("Retrieve venue context", "MongoDB Atlas Vector Search", f"Vector search failed; falling back to find: {exc}", 0.0)
             pass
 
     terms = search_terms(question)
@@ -296,30 +415,74 @@ def search_venue_context(question: str, limit: int = 5) -> list[dict]:
             {"description": {"$regex": pattern, "$options": "i"}},
         ])
     try:
-        return [_strip_mongo_id(doc) for doc in get_venues_collection().find(query, {"embedding": 0}).limit(limit)]
-    except Exception:
+        start = time.perf_counter()
+        results = [_strip_mongo_id(doc) for doc in get_venues_collection().find(query, {"embedding": 0}).limit(limit)]
+        add_ai_trace_step(
+            "Retrieve venue context",
+            "MongoDB Atlas",
+            f"Fallback find on `{COLLECTION_NAME}` returned {len(results)} venue(s).",
+            (time.perf_counter() - start) * 1000,
+        )
+        return results
+    except Exception as exc:
+        add_ai_trace_step("Retrieve venue context", "MongoDB Atlas", f"Fallback find failed: {exc}", 0.0)
         return []
+
+
+def fetch_venues_for_bookings(bookings: list[dict]) -> list[dict]:
+    venue_ids = sorted({booking.get("venue_id") for booking in bookings if booking.get("venue_id")})
+    if not venue_ids:
+        return []
+    start = time.perf_counter()
+    try:
+        docs = get_venues_collection().find(
+            {"venue_id": {"$in": venue_ids}},
+            {"embedding": 0},
+        )
+        results = [_strip_mongo_id(doc) for doc in docs]
+        add_ai_trace_step(
+            "Enrich booked venues",
+            "MongoDB Atlas",
+            f"Exact indexed lookup by `venue_id` returned {len(results)} venue(s) for {len(venue_ids)} booking venue id(s).",
+            (time.perf_counter() - start) * 1000,
+        )
+        return results
+    except Exception as exc:
+        add_ai_trace_step(
+            "Enrich booked venues",
+            "MongoDB Atlas",
+            f"Exact booked-venue lookup failed: {exc}",
+            (time.perf_counter() - start) * 1000,
+        )
+        return []
+
+
+def merge_venues(*venue_groups: list[dict]) -> list[dict]:
+    merged = {}
+    for venues in venue_groups:
+        for venue in venues:
+            key = venue.get("venue_id") or venue.get("_id")
+            if key and key not in merged:
+                merged[key] = venue
+    return list(merged.values())
 
 
 def backfill_venue_embeddings(limit: int = 200) -> tuple[int, str | None]:
     if not VOYAGE_API_KEY:
         return 0, "VOYAGE_API_KEY is not set."
     try:
-        import voyageai
-
         venues = list(get_venues_collection().find(
             {"embedding": {"$exists": False}},
             {"embedding": 0},
         ).limit(limit))
         if not venues:
             return 0, None
-        client = voyageai.Client(api_key=VOYAGE_API_KEY)
         updated = 0
         for i in range(0, len(venues), 16):
             batch = venues[i:i + 16]
             texts = [venue_to_text(venue) for venue in batch]
-            result = client.embed(texts, model=VOYAGE_EMBED_MODEL, input_type="document")
-            for venue, embedding, text in zip(batch, result.embeddings, texts):
+            embeddings = embed_texts(texts, input_type="document")
+            for venue, embedding, text in zip(batch, embeddings, texts):
                 get_venues_collection().update_one(
                     {"_id": venue["_id"]},
                     {"$set": {"embedding": embedding, "embedding_model": VOYAGE_EMBED_MODEL, "embedding_text": text}},
@@ -418,6 +581,7 @@ def generate_chat_answer(question: str, bookings: list[dict], venues: list[dict]
             "venues": [{k: v for k, v in vdoc.items() if k != "embedding"} for vdoc in venues],
         }
         base_url = (OPENAI_BASE_URL or "https://api.openai.com/v1").rstrip("/")
+        start = time.perf_counter()
         response = requests.post(
             f"{base_url}/responses",
             headers={
@@ -438,8 +602,15 @@ def generate_chat_answer(question: str, bookings: list[dict], venues: list[dict]
         )
         response.raise_for_status()
         answer = extract_responses_text(response.json())
+        add_ai_trace_step(
+            "Generate answer",
+            "LLM Gateway",
+            f"Responses API call to model `{OPENAI_MODEL}`.",
+            (time.perf_counter() - start) * 1000,
+        )
         return answer or fallback_chat_answer(question, bookings, venues)
     except Exception as exc:
+        add_ai_trace_step("Generate answer", "LLM Gateway", f"Responses API call failed: {exc}", (time.perf_counter() - start) * 1000 if "start" in locals() else 0.0)
         return (
             f"I found relevant MongoDB context, but the OpenAI-compatible chat call failed: {exc}. "
             "Check `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, and network access.\n\n"
@@ -449,40 +620,49 @@ def generate_chat_answer(question: str, bookings: list[dict], venues: list[dict]
 
 def handle_chat(prompt: str) -> str:
     text = prompt.strip()
+    start_ai_trace(text)
+    route_start = time.perf_counter()
     lower = text.lower()
     booking_ids = re.findall(r"BKG-[\w-]+", text, flags=re.IGNORECASE)
+
+    def respond(answer: str) -> str:
+        finish_ai_trace(answer)
+        return answer
+
+    add_ai_trace_step("Route request", "Streamlit App", "Classified the prompt and selected the execution path.", (time.perf_counter() - route_start) * 1000)
 
     if st.session_state.pending_cancel_booking_id and lower in {"yes", "y", "confirm", "confirm cancel", "cancel it"}:
         booking_id = st.session_state.pending_cancel_booking_id
         st.session_state.pending_cancel_booking_id = None
         _, message = cancel_booking(booking_id)
-        return message
+        return respond(message)
 
     if "cancel" in lower:
         active = fetch_user_bookings(include_cancelled=False)
         if booking_ids:
             booking_id = booking_ids[0].upper()
             st.session_state.pending_cancel_booking_id = booking_id
-            return f"Please confirm: should I cancel booking `{booking_id}`? Reply `confirm` to proceed."
+            return respond(f"Please confirm: should I cancel booking `{booking_id}`? Reply `confirm` to proceed.")
         booking, clarification = resolve_booking_from_context(text, active)
         if booking:
             booking_id = booking["booking_id"]
             st.session_state.pending_cancel_booking_id = booking_id
-            return (
+            return respond(
                 f"I found `{booking_id}` for {booking.get('venue_name')} in {booking.get('city')}, "
                 f"check-in {booking.get('check_in')}. Reply `confirm` to cancel it."
             )
-        return clarification or "Which booking should I cancel?"
+        return respond(clarification or "Which booking should I cancel?")
 
-    if any(phrase in lower for phrase in ["my bookings", "show bookings", "view bookings", "list bookings", "what bookings"]):
+    if "show bookings" in lower:
         bookings = fetch_user_bookings()
         st.session_state.last_booking_context = bookings
-        return summarize_bookings(bookings)
+        return respond(summarize_bookings(bookings))
 
     bookings = search_booking_context(text)
     st.session_state.last_booking_context = bookings
-    venues = search_venue_context(text)
-    return generate_chat_answer(text, bookings, venues)
+    booked_venues = fetch_venues_for_bookings(bookings)
+    venues = merge_venues(booked_venues, search_venue_context(text))
+    return respond(generate_chat_answer(text, bookings, venues))
 
 # ---------------------------------------------------------------------------
 # Metrics: every operation below is timed and written to METRICS_COLLECTION
@@ -826,10 +1006,46 @@ with tab_ui:
 # TAB 2 -- AI Concierge
 # ===========================================================================
 with tab_chat:
-    st.markdown("### AI Concierge")
-    st.caption(
-        "Ask about your bookings or venues. Voyage embeddings retrieve relevant MongoDB context; "
-        "an LLM drafts the answer when `OPENAI_API_KEY` is configured."
+    st.markdown(
+        """
+        <style>
+        .ai-concierge-header {
+            border: 1px solid rgba(120,120,120,0.24);
+            border-radius: 18px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            background: linear-gradient(135deg, rgba(19,170,82,0.12), rgba(90,108,255,0.10));
+        }
+        .ai-concierge-header h3 { margin: 0 0 6px 0; }
+        .ai-concierge-header p { margin: 0; color: rgba(120,120,120,0.95); }
+        .ai-latest-label {
+            margin: 16px 0 8px;
+            color: rgba(120,120,120,0.95);
+            font-size: 0.9rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .ai-composer-help {
+            margin: 12px 0 6px;
+            color: rgba(120,120,120,0.95);
+            font-size: 0.9rem;
+        }
+        .ai-empty-state {
+            border: 1px dashed rgba(120,120,120,0.35);
+            border-radius: 16px;
+            padding: 18px;
+            margin-top: 14px;
+            color: rgba(120,120,120,0.95);
+            background: rgba(120,120,120,0.035);
+        }
+        </style>
+        <div class="ai-concierge-header">
+            <h3>AI Concierge</h3>
+            <p>Ask about bookings, cancellations, venues, cities, dates, or amenities. Voyage embeddings retrieve MongoDB context; the chat model turns it into an answer.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     setup_notes = []
@@ -845,25 +1061,52 @@ with tab_chat:
     c2.metric("Bookings", len(fetch_user_bookings()))
     c3.metric("Chat model", OPENAI_MODEL if OPENAI_API_KEY else "Not configured")
 
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    st.markdown('<div class="ai-composer-help">Ask a question or request an action</div>', unsafe_allow_html=True)
+    with st.form("ai_concierge_form", clear_on_submit=True, border=False):
+        prompt_col, send_col = st.columns([7, 1])
+        with prompt_col:
+            prompt = st.text_input(
+                "Message",
+                placeholder="Try: Cancel my Singapore booking, show bookings, or tell me about the hotel I booked",
+                label_visibility="collapsed",
+            )
+        with send_col:
+            submitted = st.form_submit_button("Send", use_container_width=True)
 
-    if prompt := st.chat_input("Ask about bookings, venues, or say 'cancel BKG-...'", key="ai_concierge_input"):
+    if submitted and prompt.strip():
+        prompt = prompt.strip()
         st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("Retrieving context from MongoDB..."):
-                answer = handle_chat(prompt)
-            st.markdown(answer)
+        with st.spinner("Retrieving context from MongoDB..."):
+            answer = handle_chat(prompt)
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
+
+    if st.session_state.chat_history:
+        st.markdown('<div class="ai-latest-label">Latest conversation</div>', unsafe_allow_html=True)
+        for message in reversed(st.session_state.chat_history):
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+    else:
+        st.markdown(
+            """
+            <div class="ai-empty-state">
+                Start with something like <strong>show bookings</strong>,
+                <strong>cancel my Singapore booking</strong>, or
+                <strong>what amenities does my hotel have?</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 # ===========================================================================
 # TAB 3 -- Behind the Scenes
 # ===========================================================================
 with tab_internals:
-    sub_arch, sub_query, sub_perf = st.tabs(["\U0001F5FA️ Architecture", "\U0001F50E MQL Query Inspector", "\U0001F4CA Performance Scorecard"])
+    sub_arch, sub_query, sub_ai_trace, sub_perf = st.tabs([
+        "\U0001F5FA️ Architecture",
+        "\U0001F50E MQL Query Inspector",
+        "\U0001F916 AI Concierge Trace",
+        "\U0001F4CA Performance Scorecard",
+    ])
 
     # ---- Architecture diagram ----
     with sub_arch:
@@ -1052,6 +1295,79 @@ with tab_internals:
                 }, indent=2),
                 language="json",
             )
+
+    # ---- AI Concierge trace ----
+    with sub_ai_trace:
+        st.markdown(
+            "Shows the **last AI Concierge request path** from prompt routing through Voyage embeddings, "
+            "Atlas retrieval, and LLM generation. The goal is to make it clear where latency is spent."
+        )
+        trace = st.session_state.last_ai_trace
+        if not trace:
+            st.info("Ask the AI Concierge a question first, then come back here to inspect the trace.")
+        else:
+            st.caption(f"Prompt: `{trace['prompt']}`")
+            steps = trace.get("steps", [])
+            total_ms = trace.get("total_latency_ms", 0.0)
+            by_engine = {}
+            for step in steps:
+                by_engine[step["engine"]] = by_engine.get(step["engine"], 0.0) + step["latency_ms"]
+            llm_ms = by_engine.get("LLM Gateway", 0.0)
+            atlas_ms = sum(ms for engine, ms in by_engine.items() if "MongoDB" in engine)
+            voyage_ms = by_engine.get("Voyage AI", 0.0)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total traced latency", f"{total_ms:,.1f} ms")
+            m2.metric("LLM", f"{llm_ms:,.1f} ms")
+            m3.metric("Voyage embeddings", f"{voyage_ms:,.1f} ms")
+            m4.metric("Atlas retrieval/writes", f"{atlas_ms:,.1f} ms")
+
+            if total_ms and llm_ms:
+                st.success(f"LLM generation accounted for about {(llm_ms / total_ms) * 100:.1f}% of traced latency on this request.")
+            elif total_ms:
+                st.info("This request did not call the LLM path, so latency is mostly routing and MongoDB operations.")
+
+            st.markdown(
+                """
+                <style>
+                .ai-trace-flow {
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 12px;
+                    margin: 18px 0;
+                }
+                .ai-trace-node {
+                    border: 1px solid rgba(120,120,120,0.25);
+                    border-radius: 14px;
+                    padding: 12px;
+                    background: rgba(120,120,120,0.04);
+                }
+                .ai-trace-node strong { display:block; margin-bottom: 4px; }
+                .ai-trace-node span { color: rgba(120,120,120,0.95); font-size: 0.86rem; }
+                @media (max-width: 900px) { .ai-trace-flow { grid-template-columns: 1fr; } }
+                </style>
+                <div class="ai-trace-flow">
+                    <div class="ai-trace-node"><strong>1. Route intent</strong><span>Classify direct action vs retrieval question.</span></div>
+                    <div class="ai-trace-node"><strong>2. Embed query</strong><span>Voyage converts text into vectors.</span></div>
+                    <div class="ai-trace-node"><strong>3. Retrieve context</strong><span>Atlas Vector Search / MongoDB finds bookings and venues.</span></div>
+                    <div class="ai-trace-node"><strong>4. Generate answer</strong><span>LLM drafts the final response from context.</span></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if steps:
+                step_df = pd.DataFrame(steps)
+                st.markdown("##### Step Latency")
+                st.dataframe(
+                    step_df[["step", "name", "engine", "detail", "latency_ms"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.markdown("##### Latency By Component")
+                st.bar_chart(pd.DataFrame.from_dict(by_engine, orient="index", columns=["latency_ms"]))
+            with st.expander("Raw trace JSON"):
+                st.code(json.dumps(trace, indent=2, default=str), language="json")
 
     # ---- Performance scorecard ----
     with sub_perf:
