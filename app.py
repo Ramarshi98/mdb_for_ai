@@ -3,7 +3,7 @@ AtlasTrips -- app.py
 ====================
 A Streamlit demo that doubles as the user-facing booking UI AND an
 executive/technical demo of why a single MongoDB Atlas cluster (operational
-data + Atlas Search) replaces a Postgres/Aurora + ORM + OpenSearch stack at
+data + Atlas Search) replaces a decoupled search architecture at
 high scale.
 
 Tab 1, "Travel Search": live type-ahead autocomplete (Atlas Search
@@ -321,7 +321,7 @@ def cancel_booking(booking_id: str) -> tuple[bool, str]:
     return True, f"Cancelled booking `{booking_id}` for {booking.get('venue_name')}."
 
 
-def search_booking_context(question: str, limit: int = 5) -> list[dict]:
+def search_booking_context(question: str, query_embedding=None, limit: int = 5) -> list[dict]:
     def fallback_booking_context(reason: str) -> list[dict]:
         terms = search_terms(question)
         bookings = fetch_user_bookings(include_cancelled=True)
@@ -338,7 +338,7 @@ def search_booking_context(question: str, limit: int = 5) -> list[dict]:
         )
         return results
 
-    embedding = embed_text(question, input_type="query")
+    embedding = query_embedding if query_embedding is not None else embed_text(question, input_type="query")
     if embedding:
         pipeline = [
             {"$vectorSearch": {
@@ -372,8 +372,8 @@ def search_booking_context(question: str, limit: int = 5) -> list[dict]:
     return fallback_booking_context("Embeddings unavailable")
 
 
-def search_venue_context(question: str, limit: int = 5) -> list[dict]:
-    embedding = embed_text(question, input_type="query")
+def search_venue_context(question: str, query_embedding=None, limit: int = 5) -> list[dict]:
+    embedding = query_embedding if query_embedding is not None else embed_text(question, input_type="query")
     if embedding:
         pipeline = [
             {"$vectorSearch": {
@@ -658,10 +658,11 @@ def handle_chat(prompt: str) -> str:
         st.session_state.last_booking_context = bookings
         return respond(summarize_bookings(bookings))
 
-    bookings = search_booking_context(text)
+    query_embedding = embed_text(text, input_type="query")
+    bookings = search_booking_context(text, query_embedding=query_embedding)
     st.session_state.last_booking_context = bookings
     booked_venues = fetch_venues_for_bookings(bookings)
-    venues = merge_venues(booked_venues, search_venue_context(text))
+    venues = merge_venues(booked_venues, search_venue_context(text, query_embedding=query_embedding))
     return respond(generate_chat_answer(text, bookings, venues))
 
 # ---------------------------------------------------------------------------
@@ -721,10 +722,10 @@ def fetch_live_mongo_stats(window_minutes: int = 5):
 # Customer baseline placeholder for the legacy stack. Fill these in during
 # discovery for an apples-to-apples comparison.
 LEGACY_REFERENCE_STATS = {
-    "label": "Aurora (Postgres) + ORM + OpenSearch sync — customer baseline",
+    "label": "Decoupled Search Architecture — customer baseline",
     "p50": None, "p95": None, "p99": None,
     "error_rate_pct": None, "approx_rps": None,
-    "note": "Ask the customer for their Aurora + ORM + OpenSearch baseline metrics, "
+    "note": "Ask the customer for their decoupled search architecture baseline metrics, "
             "then fill them in here for an apples-to-apples comparison.",
 }
 MONGO_REFERENCE_STATS = {
@@ -1219,7 +1220,7 @@ with tab_internals:
                     </div>
                 </div>
                 <div class="arch-lane">
-                    <h4>Aurora + ORM + OpenSearch path</h4>
+                    <h4>Decoupled Search Architecture path</h4>
                     <div class="arch-summary">The app must coordinate normalized tables, search infrastructure, and merge logic.</div>
                     <div class="arch-step arch-neutral">
                         <div class="arch-num">1</div>
@@ -1240,18 +1241,18 @@ with tab_internals:
                             </div>
                             <div class="arch-step arch-legacy">
                                 <div class="arch-num">4A</div>
-                                <div><div class="arch-title">Aurora joins tables</div><span class="arch-detail">Venues, regions, pricing, availability, and facilities are joined together.</span></div>
+                                <div><div class="arch-title">DB joins tables</div><span class="arch-detail">Venues, regions, pricing, availability, and facilities are joined together.</span></div>
                             </div>
                         </div>
                         <div>
                             <div class="arch-branch-label">Search index path</div>
                             <div class="arch-step arch-legacy">
                                 <div class="arch-num">3B</div>
-                                <div><div class="arch-title">CDC sync feeds OpenSearch</div><span class="arch-detail">Changes must be copied from Aurora into a second system.</span></div>
+                                <div><div class="arch-title">CDC sync feeds Search Engine</div><span class="arch-detail">Changes must be copied from the DB into a second system.</span></div>
                             </div>
                             <div class="arch-step arch-legacy">
                                 <div class="arch-num">4B</div>
-                                <div><div class="arch-title">OpenSearch returns hits</div><span class="arch-detail">Results can lag behind the source database.</span></div>
+                                <div><div class="arch-title">Search Engine returns hits</div><span class="arch-detail">Results can lag behind the source database.</span></div>
                             </div>
                         </div>
                     </div>
@@ -1375,7 +1376,7 @@ with tab_internals:
             "Left column is **live** -- computed from real latency/outcome samples this app "
             "(and any running `locustfile.py`) just wrote to the `metrics_events` collection "
             "in the same Atlas cluster. Right column is reserved for the customer's "
-            "Aurora + ORM + OpenSearch baseline metrics."
+            "Decoupled Search Architecture baseline metrics."
         )
         live = fetch_live_mongo_stats(window_minutes=5)
         mongo_stats = live or MONGO_REFERENCE_STATS
@@ -1395,7 +1396,7 @@ with tab_internals:
             else:
                 st.caption(MONGO_REFERENCE_STATS["note"])
         with c2:
-            st.markdown("##### Aurora + ORM + OpenSearch (customer baseline)")
+            st.markdown("##### Decoupled Search Architecture (customer baseline)")
             st.metric("p99 latency", f"{legacy_stats['p99']:.1f} ms" if legacy_stats["p99"] is not None else "--")
             lc1, lc2 = st.columns(2)
             lc1.metric("p50", f"{legacy_stats['p50']:.1f} ms" if legacy_stats["p50"] is not None else "--")
@@ -1411,7 +1412,7 @@ with tab_internals:
         chart_df = pd.DataFrame(
             {
                 "MongoDB Atlas": [mongo_stats["p50"], mongo_stats["p95"], mongo_stats["p99"]],
-                "Aurora + ORM + OpenSearch": [legacy_stats["p50"], legacy_stats["p95"], legacy_stats["p99"]],
+                "Decoupled Search Architecture": [legacy_stats["p50"], legacy_stats["p95"], legacy_stats["p99"]],
             },
             index=["p50", "p95", "p99"],
         )
