@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from faker import Faker
 
 from db.connection import (
+    get_bookings_collection,
     get_users_collection,
     get_venues_collection,
 )
@@ -344,11 +345,13 @@ def generate_users(count: int, venues: list[dict]) -> list[dict]:
 def seed_database(venue_count: int, user_count: int = 300, reset: bool = False) -> None:
     venues_coll = get_venues_collection()
     users_coll = get_users_collection()
+    bookings_coll = get_bookings_collection()
 
     if reset:
-        print(f"Dropping existing collections: {venues_coll.name}, {users_coll.name}")
+        print(f"Dropping existing collections: {venues_coll.name}, {users_coll.name}, {bookings_coll.name}")
         venues_coll.drop()
         users_coll.drop()
+        bookings_coll.drop()
 
     print(f"Generating {venue_count} venue documents...")
     venues = generate_venues(venue_count)
@@ -367,6 +370,8 @@ def seed_database(venue_count: int, user_count: int = 300, reset: bool = False) 
     venues_coll.create_index([("region.city", 1)])
     venues_coll.create_index([("category", 1)])
     users_coll.create_index("user_id", unique=True)
+    bookings_coll.create_index("booking_id", unique=True)
+    bookings_coll.create_index([("session_user_id", 1), ("status", 1), ("booked_at", -1)])
 
     print(f"Seeded {venues_coll.count_documents({})} venues and {users_coll.count_documents({})} users.")
     print("Next step: create the Atlas Search index from search/atlas_search_index.json")

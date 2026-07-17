@@ -25,6 +25,7 @@ MONGODB_ATLAS_URI = os.getenv("MONGODB_ATLAS_URI", "")
 DB_NAME = os.getenv("DB_NAME", "atlastrips")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "venues")
 USERS_COLLECTION_NAME = os.getenv("USERS_COLLECTION_NAME", "users")
+BOOKINGS_COLLECTION_NAME = os.getenv("BOOKINGS_COLLECTION_NAME", "bookings")
 SEARCH_INDEX_NAME = os.getenv("SEARCH_INDEX_NAME", "venues_autocomplete")
 SEED_DOCUMENT_COUNT = int(os.getenv("SEED_DOCUMENT_COUNT", "2000"))
 # Stores per-request latency/outcome samples from both app.py and locustfile.py
@@ -40,7 +41,7 @@ def get_client() -> MongoClient:
     internally, so one client per process is the recommended pattern)."""
     if not MONGODB_ATLAS_URI:
         raise RuntimeError(
-            "MONGODB_ATLAS_URI is not set. Copy .env.example to .env and "
+            "MONGODB_ATLAS_URI is not set. Copy env.example to .env and "
             "fill in your Atlas connection string."
         )
     return MongoClient(
@@ -61,6 +62,10 @@ def get_venues_collection() -> Collection:
 
 def get_users_collection() -> Collection:
     return get_db()[USERS_COLLECTION_NAME]
+
+
+def get_bookings_collection() -> Collection:
+    return get_db()[BOOKINGS_COLLECTION_NAME]
 
 
 def get_metrics_collection() -> Collection:
