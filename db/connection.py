@@ -38,6 +38,12 @@ METRICS_COLLECTION_NAME = os.getenv("METRICS_COLLECTION_NAME", "metrics_events")
 # sessions, which would otherwise slow down the very query that powers the
 # Performance Scorecard's "live" numbers.
 METRICS_TTL_SECONDS = int(os.getenv("METRICS_TTL_SECONDS", str(24 * 60 * 60)))
+# Prewarms the connection pool with this many connections at client creation
+# instead of establishing them lazily on first use. Without a floor, the
+# first burst of concurrent Locust users pays connection-establishment cost,
+# which shows up as inflated p95/p99 on exactly the samples that open a load
+# test -- prewarming keeps those early samples representative of steady state.
+MONGODB_MIN_POOL_SIZE = int(os.getenv("MONGODB_MIN_POOL_SIZE", "20"))
 
 
 @lru_cache(maxsize=1)
@@ -53,6 +59,7 @@ def get_client() -> MongoClient:
         MONGODB_ATLAS_URI,
         appname="AtlasTrips",
         maxPoolSize=200,
+        minPoolSize=MONGODB_MIN_POOL_SIZE,
         retryWrites=True,
     )
 
