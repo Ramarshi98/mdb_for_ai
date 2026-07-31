@@ -684,38 +684,46 @@ def record_metric(operation: str, latency_ms: float, success: bool) -> None:
         pass  # metrics are best-effort; never block the user-facing flow
 
 
-def _percentile(values, pct: float):
-    if not values:
-        return None
-    data = sorted(values)
-    k = (len(data) - 1) * (pct / 100)
-    f, c = int(k), min(int(k) + 1, len(data) - 1)
-    if f == c:
-        return data[f]
-    return data[f] * (c - k) + data[c] * (k - f)
-
-
 def fetch_live_mongo_stats(window_minutes: int = 5):
     """Aggregate real latency/outcome samples written by THIS app and by any
     concurrently running `locustfile.py` load test, all stored in the same
-    Atlas cluster (unified workload telemetry, no separate metrics stack)."""
+    Atlas cluster (unified workload telemetry, no separate metrics stack).
+
+    Percentiles are computed server-side with $percentile (MongoDB 7.0+) so
+    only one summary document crosses the wire, instead of pulling up to
+    tens of thousands of raw samples into the app to sort in Python -- the
+    same trade-off the rest of this demo makes against a decoupled stack."""
     try:
         coll = get_metrics_collection()
         since = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
-        docs = list(coll.find({"ts": {"$gte": since}}, {"latency_ms": 1, "success": 1}).limit(50000))
+        pipeline = [
+            {"$match": {"ts": {"$gte": since}}},
+            {"$group": {
+                "_id": None,
+                "count": {"$sum": 1},
+                "success_count": {"$sum": {"$cond": ["$success", 1, 0]}},
+                "percentiles": {
+                    "$percentile": {
+                        "input": "$latency_ms",
+                        "p": [0.50, 0.95, 0.99],
+                        "method": "approximate",
+                    }
+                },
+            }},
+        ]
+        result = next(coll.aggregate(pipeline), None)
     except Exception:
         return None
-    if not docs:
+    if not result or not result["count"]:
         return None
-    latencies = [d["latency_ms"] for d in docs if "latency_ms" in d]
-    successes = sum(1 for d in docs if d.get("success"))
+    p50, p95, p99 = result["percentiles"]
     return {
-        "count": len(docs),
-        "p50": _percentile(latencies, 50),
-        "p95": _percentile(latencies, 95),
-        "p99": _percentile(latencies, 99),
-        "error_rate_pct": 100.0 * (1 - successes / len(docs)),
-        "approx_rps": len(docs) / (window_minutes * 60),
+        "count": result["count"],
+        "p50": p50,
+        "p95": p95,
+        "p99": p99,
+        "error_rate_pct": 100.0 * (1 - result["success_count"] / result["count"]),
+        "approx_rps": result["count"] / (window_minutes * 60),
     }
 
 

@@ -33,6 +33,17 @@ SEED_DOCUMENT_COUNT = int(os.getenv("SEED_DOCUMENT_COUNT", "2000"))
 # the MongoDB path while a Locust run is in progress -- one engine handles
 # the operational traffic, the search traffic, AND the telemetry about both.
 METRICS_COLLECTION_NAME = os.getenv("METRICS_COLLECTION_NAME", "metrics_events")
+# How long a metrics sample lives before Atlas auto-expires it (TTL index).
+# Keeps metrics_events from growing unbounded across repeated demo/load-test
+# sessions, which would otherwise slow down the very query that powers the
+# Performance Scorecard's "live" numbers.
+METRICS_TTL_SECONDS = int(os.getenv("METRICS_TTL_SECONDS", str(24 * 60 * 60)))
+# Prewarms the connection pool with this many connections at client creation
+# instead of establishing them lazily on first use. Without a floor, the
+# first burst of concurrent Locust users pays connection-establishment cost,
+# which shows up as inflated p95/p99 on exactly the samples that open a load
+# test -- prewarming keeps those early samples representative of steady state.
+MONGODB_MIN_POOL_SIZE = int(os.getenv("MONGODB_MIN_POOL_SIZE", "20"))
 
 
 @lru_cache(maxsize=1)
@@ -48,6 +59,7 @@ def get_client() -> MongoClient:
         MONGODB_ATLAS_URI,
         appname="AtlasTrips",
         maxPoolSize=200,
+        minPoolSize=MONGODB_MIN_POOL_SIZE,
         retryWrites=True,
     )
 
@@ -68,7 +80,21 @@ def get_bookings_collection() -> Collection:
     return get_db()[BOOKINGS_COLLECTION_NAME]
 
 
+@lru_cache(maxsize=1)
+def _ensure_metrics_indexes() -> None:
+    """Create metrics_events indexes once per process. Both app.py and
+    locustfile.py write here on every request, and the Performance Scorecard
+    reads it back with a `ts` range query -- without an index that query
+    degenerates into a growing collection scan as the demo runs longer. Index
+    creation is idempotent, so this is safe to call unconditionally; the
+    lru_cache just avoids repeating the (no-op) call on every access."""
+    coll = get_db()[METRICS_COLLECTION_NAME]
+    coll.create_index([("ts", -1)])
+    coll.create_index("ts", name="ts_ttl", expireAfterSeconds=METRICS_TTL_SECONDS)
+
+
 def get_metrics_collection() -> Collection:
+    _ensure_metrics_indexes()
     return get_db()[METRICS_COLLECTION_NAME]
 
 
