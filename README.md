@@ -45,19 +45,74 @@ mdb_for_ai/
    embedded booking history. You can also re-run seeding from the app's
    sidebar ("Seed / reset demo data").
 
-4. **Create the Atlas Search index**: in the Atlas UI, go to your cluster ->
-   **Search** -> **Create Search Index** -> **JSON Editor**, and paste the
-   contents of `search/atlas_search_index.json` (the `definition` key is what
-   the JSON Editor expects; the index name should be `venues_autocomplete`
-   to match `SEARCH_INDEX_NAME` in `.env`). This index powers `edgeGram`
-   autocomplete on `name`, `region.city`, and `category`.
+4. **Create the Atlas Search / Vector Search indexes**: the seeder creates the
+   regular MongoDB indexes for operational reads, but Atlas Search and Atlas
+   Vector Search indexes are managed separately in Atlas. If you seed with
+   `--reset` or use the app's "Drop existing collections first" option, recreate
+   these indexes after the reset finishes.
 
-5. **Run the app**:
+   Autocomplete search index on the `venues` collection:
+   - In Atlas, go to your cluster -> **Search** -> **Create Search Index** ->
+     **JSON Editor**.
+   - Use index name `venues_autocomplete` to match `SEARCH_INDEX_NAME`.
+   - Paste the `definition` object from `search/atlas_search_index.json`.
+   - This powers `edgeGram` autocomplete on `name`, `region.city`, and
+     `category`.
+
+   Vector Search index on the `venues` collection:
+   - Create an Atlas Vector Search index named `venues_voyage_vector` to match
+     `VENUE_VECTOR_INDEX_NAME`.
+   - Use this definition:
+     ```json
+     {
+       "fields": [
+         {
+           "type": "vector",
+           "path": "embedding",
+           "numDimensions": 1024,
+           "similarity": "cosine"
+         }
+       ]
+     }
+     ```
+
+   Vector Search index on the `bookings` collection:
+   - Create an Atlas Vector Search index named `bookings_voyage_vector` to match
+     `BOOKING_VECTOR_INDEX_NAME`.
+   - Use this definition:
+     ```json
+     {
+       "fields": [
+         {
+           "type": "vector",
+           "path": "embedding",
+           "numDimensions": 1024,
+           "similarity": "cosine"
+         },
+         {
+           "type": "filter",
+           "path": "session_user_id"
+         }
+       ]
+     }
+     ```
+
+   The default `VOYAGE_EMBED_MODEL` is `voyage-4-large`, which returns
+   1024-dimensional embeddings unless you configure a different output
+   dimension. If you change the embedding dimension, update `numDimensions` to
+   match and re-embed affected documents.
+
+5. **Backfill venue embeddings** (optional, required for venue Vector Search):
+   set `VOYAGE_API_KEY`, run the app, then use the sidebar's "Voyage embeddings"
+   panel to backfill venue embeddings. Booking embeddings are created when demo
+   bookings are written.
+
+6. **Run the app**:
    ```
    streamlit run app.py
    ```
 
-6. **Run the load test** (optional, generates live numbers for the
+7. **Run the load test** (optional, generates live numbers for the
    Performance Scorecard tab):
    ```
    locust -f locustfile.py
